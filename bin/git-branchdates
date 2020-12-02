@@ -1,0 +1,1054 @@
+#!/usr/bin/env perl
+#
+# git-branchdates
+#
+# Roland Walker
+# walker@pobox.com
+#
+# BSD 2-Clause License
+#
+#     Copyright (c) 2020, Roland Walker
+#     All rights reserved.
+#
+#     Redistribution and use in source and binary forms, with or without
+#     modification, are permitted provided that the following conditions are met:
+#
+#     1. Redistributions of source code must retain the above copyright notice, this
+#        list of conditions and the following disclaimer.
+#
+#     2. Redistributions in binary form must reproduce the above copyright notice,
+#        this list of conditions and the following disclaimer in the documentation
+#        and/or other materials provided with the distribution.
+#
+#     THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+#     AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#     IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+#     DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+#     FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+#     DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+#     SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+#     CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+#     OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+#     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# notes
+#
+#     consider the following in ~/.gitconfig
+#
+#         [alias]
+#         bd = branchdates
+#
+# bugs
+#
+# todo
+#
+#     there should be more than one category of remote-tracking, as in
+#       * Local branches configured for 'git pull'
+#       * Local refs configured for 'git push'
+#     from git remote show origin
+#
+
+###
+### pragmas
+###
+
+# coding
+use strict   qw/vars subs/;
+use warnings;
+no  warnings qw/uninitialized numeric qw/;
+# use warnings::unused;
+# no  indirect;
+# use criticism;
+
+# behavior
+use autodie  qw/open close truncate/;
+use sigtrap  qw/die normal-signals error-signals/;   # for tempfile cleanup
+
+# unicode
+use 5.014;
+use warnings qw/FATAL utf8/;
+use utf8;
+use feature  qw/unicode_strings unicode_eval evalbytes/;
+use open     qw/:encoding(utf8)/;
+use open     qw/:std/;
+
+# features
+use feature  qw/say state fc current_sub/;
+
+###
+### version
+###
+
+our $VERSION = '1.000';
+    $VERSION = eval $VERSION;
+
+###
+### modules
+###
+
+use Encode qw/decode_utf8/;
+use Getopt::Long qw/GetOptions/;
+use Time::Piece;
+use version;
+
+###
+### subroutine prototypes
+###
+
+sub revise_modes                      ( $     );
+sub revise_date_format                ( $     );
+sub revise_indicator_key_order        ( $$    );
+sub get_branchtimes_by_commit_date    (       );
+sub bump_branchtimes_by_checkout_date ( $     );
+sub get_ignores                       ( $     );
+sub get_merged_branches               ( $     );
+sub get_remote_associated_branches    ( $     );
+sub get_pr_statuses                   ( $     );
+sub get_ci_statuses                   ( $     );
+sub read_pr_status_cache              (       );
+sub write_pr_status_cache             ( $$    );
+sub ensure_gh                         (       );
+sub deduce_inverted_statuses          ( $$$   );
+sub remove_ignores                    ( $$    );
+sub get_widest_width                  ( $     );
+sub backtick                          ( $;$   );
+sub get_all_gitconfig                 (       );
+sub revise_indicators                 ( $$    );
+sub emit_output                       ( $$$$$ );
+
+###
+### configurable file-scoped lexical variables
+###
+
+my $date_format = q{%Y-%m-%d};
+
+my $indicators = {
+                  merged               => {
+                                           bg              => q{#282828},
+                                           q{notty-suffix} => q{+},
+                                          },
+                q{non-remote-associated} => {
+                                           fg              => qq{#CD853F},
+                                          },
+                q{non-pr-associated}   => {
+                                           fg              => qq{#CD853F},
+                                          },
+                q{pr-merged}           => {
+                                           bg              => q{#282828},
+                                           q{notty-suffix} => q{+},
+                                          },
+                q{ci-pending}          => {
+                                           prefix          => q{↻},
+                                          },
+                q{ci-fail}             => {
+                                           prefix          => q{✘},
+                                           q{prefix-fg}    => qq{#DC143C},
+                                          },
+                q{ci-pass}             => {
+                                           prefix          => q{✓},
+                                           q{prefix-fg}    => qq{#32CD32},
+                                          },
+                  _reset               => qq{\e[0;m},
+                  _link                => qq{\e]8;;},
+                 };
+my @indicator_key_order = qw/
+                             checked-out
+                             non-checked-out
+                             merged
+                             non-merged
+                             remote-associated
+                             non-remote-associated
+                             remote-tracking
+                             non-remote-tracking
+                             remote-ahead
+                             non-remote-ahead
+                             remote-behind
+                             non-remote-behind
+                             remote-synced
+                             non-remote-synced
+                             remote-mixed
+                             non-remote-mixed
+                             pr-associated
+                             non-pr-associated
+                             pr-open
+                             non-pr-open
+                             pr-merged
+                             non-pr-merged
+                             pr-closed
+                             non-pr-closed
+                             ci-pending
+                             non-ci-pending
+                             ci-fail
+                             non-ci-fail
+                             ci-pass
+                             non-ci-pass
+                            /;
+
+###
+### argument processing
+###
+
+# equivalent to perl -CA
+@ARGV = map { decode_utf8($_, 1) } @ARGV;
+
+my $progname = $0;
+   $progname =~ s{\A(.*/)?([^/]+?)(\.plx?)?\Z}{$2};
+
+my $usage = qq{
+$progname [ -pr | -link | -color=<string> | -pager=<string> | -sort=<string> | -help | -version ]
+
+List branches by date, where both checkout and commit activity count as
+touching the branch.
+
+Options
+
+    -pr          Gather Pull Request status from GitHub.  Slow.  Requires the
+                 "gh" command-line GitHub client.
+
+    -link        Use OSC 8 terminal escape codes to hyperlink branch names to
+                 corresponding GitHub Pull Request URLs.  Known to be supported
+                 on iTerm2.  No effect unless -pr is also set.
+
+    -color=<auto|always|never>
+
+                 Whether to use color status indicators or plain-text "notty"
+                 prefix/suffix indicators.  The default is "auto", which can be
+                 changed by "git config --global branchdates.color".
+
+                 "Color" here refers to all text styling, including bold,
+                 underline, and italic.
+
+    -pager=<auto|always|never>
+
+                 Whether to use a pager for the output.  The default is "auto"
+                 which can be changed by "git config --global branchdates.pager".
+
+                 -pager=always may be imperfect if the pager has been changed
+                 in ~/.gitconfig.
+
+    -sort=<ascending|descending>
+
+                 Sort direction for branch dates.  The default is "ascending",
+                 which can be changed by "git config --global branchdates.sort".
+
+    -help        Print this usage document.
+
+Configuration
+
+    By default, branches which are merged from the perspective of the current
+    branch are colored with a gray background, and branches which do are not
+    associated with a remote are colored with a light-brown foreground.
+
+    When -pr is in effect, branches associated with merged PRs are also
+    colored with a gray background, and CI status are added for branches
+    associated with open PRs.
+
+    Truecolor terminal support is assumed.  When output is not directed to a
+    tty, merged branches are suffixed with a "+".
+
+    To turn off those defaults:
+
+        git config --global branchdates.indicators.non-remote-associated.fg false
+        git config --global branchdates.indicators.merged.bg false
+        git config --global branchdates.indicators.merged.notty-suffix false
+        git config --global branchdates.indicators.non-pr-associated.fg false
+        git config --global branchdates.indicators.pr-merged.bg false
+        git config --global branchdates.indicators.pr-merged.notty-suffix false
+        git config --global branchdates.indicators.ci-pending.prefix false
+        git config --global branchdates.indicators.ci-pass.prefix false
+        git config --global branchdates.indicators.ci-pass.prefix-fg false
+        git config --global branchdates.indicators.ci-fail.prefix false
+        git config --global branchdates.indicators.ci-fail.prefix-fg false
+
+    The full set of branch statuses which can be set in gitconfig is
+
+        checked-out
+        non-checked-out
+        merged
+        non-merged
+        remote-associated
+        non-remote-associated
+        remote-tracking
+        non-remote-tracking
+        remote-ahead
+        non-remote-ahead
+        remote-behind
+        non-remote-behind
+        remote-synced
+        non-remote-synced
+        remote-mixed
+        non-remote-mixed
+        pr-associated
+        non-pr-associated
+        pr-open
+        non-pr-open
+        pr-merged
+        non-pr-merged
+        pr-closed
+        non-pr-closed
+        ci-pending
+        non-ci-pending
+        ci-fail
+        non-ci-fail
+        ci-pass
+        non-ci-pass
+
+    The full set of indicators which can be set is
+
+        fg            # accepts HTML-style '#FFFFFF'
+        bg            # accepts HTML-style '#FFFFFF'
+        bold          # Boolean true/false or 1/0
+        underline     # Boolean true/false or 1/0
+        italic        # Boolean true/false or 1/0
+        prefix        # literal string
+        prefix-fg     # accepts HTML-style '#FFFFFF'
+        suffix        # literal string
+        suffix-fg     # accepts HTML-style '#FFFFFF'
+        notty-prefix  # literal string
+        notty-suffix  # literal string
+
+    If you don't have Truecolor support, 16-color codes can be given as integers
+    between 30 and 107.
+
+    Examples
+
+        git config --global branchdates.indicators.remote-associated.fg '#FFFFFF'
+        git config --global branchdates.indicators.merged.bold true
+
+    Status indication can also be selectively ignored for any number of named
+    branches, using the following form
+
+        git config --local --add branchdates.ignore-status.<status> <branchname>
+
+    Any status listed above can be used for <status>, in addition to the
+    special value "all".  Multiple branchnames can be specified by successive
+    --add commands.  This configuration item is strictly --local.
+
+    Example
+
+        git config --local --add branchdates.ignore-status.all develop
+
+    The defaults for the -color=, -pager=, and -sort= options may all be
+    configured.
+
+    Example
+
+        git config --global branchdates.pager never
+        git config --local  branchdates.pr true
+
+    The date format may also be configured, using a strftime format string.
+
+    Example
+
+        git config --global branchdates.date-format '%F %T'
+
+};
+
+my $modes;
+
+Getopt::Long::Configure(qw/auto_version no_auto_abbrev prefix_pattern=--|- long_prefix_pattern=--|-/);
+die $usage unless GetOptions(
+                             q{pr}      => \$modes->{pr},
+                             q{link}    => \$modes->{link},
+                             q{color=s} => \$modes->{color},
+                             q{pager=s} => \$modes->{pager},
+                             q{sort=s}  => \$modes->{sort},
+                             q{help|h}  => \$modes->{help},
+                            );
+print $usage and exit if $modes->{help};
+die qq{$progname: -color must be one of auto, always, never\n}  if defined $modes->{color} and $modes->{color} !~ m{\A(?:auto|always|never)\Z};
+die qq{$progname: -pager must be one of auto, always, never\n}  if defined $modes->{pager} and $modes->{pager} !~ m{\A(?:auto|always|never)\Z};
+die qq{$progname: -sort must be one of ascending, descending\n} if defined $modes->{sort}  and $modes->{sort}  !~ m{\A(?:ascending|descending)\Z};
+die $usage if @ARGV;
+
+###
+### initialization
+###
+
+# unbuffered output
+select STDERR; local $|=1;
+select STDOUT; local $|=1;
+
+$modes               = revise_modes               $modes;
+$date_format         = revise_date_format         $date_format;
+@indicator_key_order = revise_indicator_key_order \@indicator_key_order, $modes;
+$indicators          = revise_indicators          $indicators, \@indicator_key_order;
+
+###
+### main
+###
+
+my ($branchtimes, $status) = get_branchtimes_by_commit_date;
+    $branchtimes = bump_branchtimes_by_checkout_date $branchtimes;
+
+my $ignores = get_ignores \@indicator_key_order;
+
+my $urls;
+$status = get_merged_branches $status;
+$status = get_remote_associated_branches $status;
+($status, $urls) = get_pr_statuses $status if $modes->{pr};
+$status = get_ci_statuses $status if $modes->{pr};
+$status = deduce_inverted_statuses $status, $branchtimes, $modes;
+$status = remove_ignores $status, $ignores;
+
+emit_output $branchtimes, $status, $indicators, $urls, $modes;
+
+###
+### subroutines
+###
+
+sub get_branchtimes_by_commit_date ( ) {
+
+    my $branchtimes = {};
+    my $status = {};
+
+    my $output = backtick [qw{git for-each-ref --sort=committerdate --format=%(committerdate:unix)%09%(refname:short)%09%(upstream:trackshort)%09%(worktreepath) refs/heads}];
+
+    foreach my $line (split /\n/, $output) {
+        my ($timestamp, $branch, $upstream, $worktree) = split /\t/, $line;
+        $branchtimes->{$branch} = $timestamp;
+        $status->{'checked-out'}{$branch}     = 1 if $worktree =~ m{\S};
+        $status->{'remote-tracking'}{$branch} = 1 if $upstream =~ m{\S};
+        $status->{'remote-ahead'}{$branch}    = 1 if $upstream eq q{>};
+        $status->{'remote-behind'}{$branch}   = 1 if $upstream eq q{<};
+        $status->{'remote-synced'}{$branch}   = 1 if $upstream eq q{=};
+        $status->{'remote-mixed'}{$branch}    = 1 if $upstream eq q{<>};
+    }
+
+    return $branchtimes, $status;
+}
+
+sub bump_branchtimes_by_checkout_date ( $ ) {
+    my (
+        $branchtimes,
+       ) = @_;
+
+    my $output = backtick [qw{git reflog show --pretty=format:%gd%x09%gs --date=unix}];
+    foreach my $line (split /\n/, $output) {
+        next unless $line =~ m{\A.*?\{(\d+)\}\tcheckout:.*?(\S+)\Z};
+        my ($timestamp, $branch) = ($1, $2);
+        next unless exists $branchtimes->{$branch};
+        next unless $timestamp > $branchtimes->{$branch};
+        $branchtimes->{$branch} = $timestamp;
+    }
+
+    return $branchtimes;
+}
+
+sub get_ignores ( $ ) {
+    my (
+        $indicator_key_order,
+       ) = @_;
+
+    my $ignores;
+
+    my ($ignore_status_output, $error) = backtick [qw{git config --local --get-regexp ^branchdates\.ignore-status}];
+    foreach my $key (@$indicator_key_order) {
+        my @ignore_status =  map { qq{\Q$_\E} }
+                             map { $_ =~ s{^branchdates\.ignore-status\.$key\s+(\S.*)}{$1}r }
+                            grep { $_ =~ m{^branchdates\.ignore-status\.$key } }
+                           split /\n/, $ignore_status_output;
+        next unless scalar @ignore_status;
+        $ignores->{$key} = \@ignore_status;
+    }
+
+    my @ignore_status_all =  map { qq{\Q$_\E} }
+                             map { $_ =~ s{^branchdates\.ignore-status\.all\s+(\S.*)}{$1}r }
+                            grep { $_ =~ m{^branchdates\.ignore-status\.all } }
+                           split /\n/, $ignore_status_output;
+    if (@ignore_status_all) {
+        foreach my $key (@$indicator_key_order) {
+            push @{$ignores->{$key}}, @ignore_status_all;
+        }
+    }
+
+    foreach my $key (@$indicator_key_order) {
+        next unless ref $ignores->{$key};
+        $ignores->{$key} = join q{|}, @{$ignores->{$key}};
+    }
+
+    return $ignores;
+}
+
+sub get_merged_branches ( $ ) {
+    my (
+        $status,
+       ) = @_;
+
+    my $current_branch = backtick [qw/git rev-parse --abbrev-ref HEAD/];
+    chomp $current_branch;
+
+    my $output = backtick [qw{git for-each-ref --merged=HEAD --format=%(refname:short) refs/heads}];
+    foreach my $branch (split /\n/, $output) {
+        next unless $branch =~ m{\S};
+        next if $branch eq $current_branch;
+        $status->{merged}{$branch} = 1;
+    }
+
+    return $status;
+}
+
+# todo: a smarter way to derive this.  The assumption about the naming will not hold.
+# This method has the advantage of picking up useful information about stale remotes.
+sub get_remote_associated_branches ( $ ) {
+    my (
+        $status,
+       ) = @_;
+
+    my $output = backtick [qw{git remote}];
+    my @remotes = split /\n/, $output;
+       @remotes = qw/origin/ unless scalar @remotes;
+
+    foreach my $remote (@remotes) {
+        my $output = backtick [qw{git branch --column=never --color=never --list --remote --format=%(refname:lstrip=3)}, qq{$remote/*}];
+        foreach my $line (split /\n/, $output) {
+            next unless $line =~ m{\S};
+            $status->{'remote-associated'}{$line} = 1;
+        }
+    }
+
+    return $status;
+}
+
+sub get_pr_statuses ( $ ) {
+    my (
+        $status,
+       ) = @_;
+
+    my $urls;
+    my $cache = read_pr_status_cache;
+
+    my $isa_tty = -t STDOUT;
+    my $branch_output = backtick [qw{git for-each-ref --format=%(refname:short) refs/heads}];
+    my $saw_gh_success;
+    my @branches = split /\n/, $branch_output;
+    my $show_progress;
+       $show_progress = 1 if scalar @branches > 5 or $modes->{verbose};
+       $show_progress = 0 if !$isa_tty or $modes->{quiet};
+
+    my $counter = 0;
+    foreach my $branch (@branches) {
+        $counter++;
+        print STDERR sprintf qq{\rPR %d/%d}, $counter, scalar @branches if $show_progress;
+        if ($cache->{status}{'pr-merged'}{$branch}) {
+            $status->{'pr-associated'}{$branch} = 1;
+            $status->{'pr-merged'}{$branch} = 1;
+            $urls->{$branch} = $cache->{url}{$branch};
+        } else {
+            my ($gh_output, $gh_err) = backtick [qw/gh pr view/, $branch];
+            next if $gh_err =~ m{\S};
+            $status->{'pr-associated'}{$branch} = 1;
+            if ($gh_output =~ m{^url:\s+(\S+)}m) {
+                $urls->{$branch} = $1;
+            }
+            foreach my $state (qw/open closed merged/) {
+                if ($gh_output =~ m{^state:\s+${state}$}mi) {
+                    $saw_gh_success = 1;
+                    $status->{"pr-$state"}{$branch} = 1;
+                    last;
+                }
+            }
+        }
+    }
+    print STDERR sprintf qq{\r%s\r}, q{ } x 20 if $show_progress;
+
+    write_pr_status_cache $status, $urls;
+
+    ensure_gh unless $saw_gh_success;
+
+    return $status, $urls;
+}
+
+sub get_ci_statuses ( $ ) {
+    my (
+        $status,
+       ) = @_;
+
+    my $isa_tty = -t STDOUT;
+    my @branches = keys %{$status->{'pr-open'}};
+    my $show_progress;
+       $show_progress = 1 if scalar @branches > 5 or $modes->{verbose};
+       $show_progress = 0 if !$isa_tty or $modes->{quiet};
+
+    my $counter = 0;
+    BRANCH: foreach my $branch (@branches) {
+        $counter++;
+        print STDERR sprintf qq{\rCI %d/%d}, $counter, scalar @branches if $show_progress;
+        my ($gh_output, $gh_err) = backtick [qw/gh pr checks/, $branch];
+        foreach my $state (qw/fail pending pass/) {
+            if ($gh_output =~ m{\t$state\t}mi) {
+                $status->{"ci-$state"}{$branch} = 1;
+                next BRANCH;
+            }
+        }
+        $status->{"ci-pending"}{$branch} = 1;
+    }
+    print STDERR sprintf qq{\r%s\r}, q{ } x 20 if $show_progress;
+
+    return $status;
+}
+
+# it only seems safe to cache the pr-merged status
+sub read_pr_status_cache ( ) {
+    my $cache = {};
+    my $config_output = get_all_gitconfig;
+    if ($config_output =~ m{^branchdates\.cache\.pr-merged\s+([^\n]*)}mi) {
+        foreach my $item (split /\s+/, $1) {
+            next unless $item =~ m{\A([^:]+):(\S*)\Z};
+            $cache->{status}{'pr-merged'}{$1} = 1;
+            $cache->{url}{$1} = $2;
+        }
+    }
+    return $cache;
+}
+
+# it only seems safe to cache the pr-merged status
+sub write_pr_status_cache ( $$ ) {
+    my (
+        $status,
+        $urls,
+       ) = @_;
+
+    my $raw_cache_data;
+    foreach my $branch (sort keys %{$status->{'pr-merged'}}) {
+        $raw_cache_data .= qq{$branch:$urls->{$branch} };
+    }
+    $raw_cache_data =~ s{ \Z}{};
+
+    if ($raw_cache_data =~ m{\S}) {
+        system (qw/git config --local branchdates.cache.pr-merged/, $raw_cache_data);
+    } else {
+        system qw/git config --local --unset branchdates.cache.pr-merged/;
+    }
+}
+
+sub ensure_gh ( ) {
+    my ($output, $error) = backtick [qw/gh --version/];
+    unless ($output =~ m{\Agh version (\S+)}) {
+        die qq{$progname: cannot find "gh" binary.  Visit https://github.com/cli/cli .\n};
+    }
+    my $version = $1;
+    my $min_required = q{1.2.1};
+    unless (version->parse($version) >= version->parse($min_required)) {
+        die qq{$progname: "gh" version $min_required is required.  Visit https://github.com/cli/cli .\n};
+    }
+    ($output, $error) = backtick [qw/git --version/];
+    if ($error =~ m{\S}) {
+        die qq{$progname: cannot find "git" binary.\n};
+    }
+    ($output, $error) = backtick [qw/git rev-parse HEAD/];
+    if ($error =~ m{\S}) {
+        die qq{$progname: not in a git repository.\n};
+    }
+    ($output, $error) = backtick [qw{gh api repos/:owner/:repo/readme}];
+    if ($error =~ m{\S}) {
+        die qq{$progname: gh failed: is auth configured? Try "gh auth login".\n};
+    }
+}
+
+sub deduce_inverted_statuses ( $$$ ) {
+    my (
+        $status,
+        $branchtimes,
+        $modes,
+       ) = @_;
+
+    my @positive_statuses = grep { $_ !~ m{^non-} }
+                            @indicator_key_order;
+
+    foreach my $branch (keys %$branchtimes) {
+        foreach my $stat (@positive_statuses) {
+            my $non_stat = qq{non-$stat};
+            if (
+                $stat ne q{pr-associated} and
+                $stat =~ m{^pr-} and
+                not $status->{'pr-associated'}{$branch}
+               ) {
+                next;
+            }
+            if (
+                $stat ne q{remote-tracking} and
+                $stat ne q{remote-associated} and
+                $stat =~ m{^remote-} and
+                not $status->{'remote-tracking'}{$branch}
+               ) {
+                next;
+            }
+            unless ($status->{$stat}{$branch}) {
+                $status->{$non_stat}{$branch} = 1;
+            }
+        }
+    }
+
+    return $status;
+}
+
+sub remove_ignores ( $$ ) {
+    my (
+        $status,
+        $ignores,
+       ) = @_;
+
+    foreach my $key (keys %$status) {
+        next unless ref $status->{$key};
+        next unless length $ignores->{$key} > 0;
+        foreach my $branch (keys %{$status->{$key}}) {
+            next unless $branch =~ m{\A(?:$ignores->{$key})\Z};
+            delete $status->{$key}{$branch};
+        }
+    }
+
+    return $status;
+}
+
+sub get_widest_width ( $ ) {
+    my (
+        $branchtimes,
+       ) = @_;
+
+    my $widest_width = 0;
+
+    foreach my $branch (keys %$branchtimes) {
+        $widest_width = length $branch if length $branch > $widest_width;
+    }
+
+    return $widest_width;
+}
+
+sub backtick ( $;$ ) {
+    my (
+        $cmd,
+        $show_stderr,
+       ) = @_;
+
+    my $saved_err;
+    unless ($show_stderr) {
+        open $saved_err, q{>&}, \*STDERR;
+        close STDERR;
+    }
+
+    my $output;
+    eval {
+        open my $fh, q{-|}, @$cmd;
+        local $/ = undef;
+        $output = <$fh>;
+        close $fh;
+    };
+    my $exception = $@;
+
+    unless ($show_stderr) {
+        open STDERR, q{>&}, $saved_err;
+    }
+
+    if ($exception and !wantarray) {
+        die qq{$progname: error executing command: } . join q{ }, @$cmd;
+    }
+
+    return ($output, $exception) if wantarray;
+    return $output;
+}
+
+{
+my $raw_gitconfig;
+sub get_all_gitconfig () {
+    return $raw_gitconfig if defined $raw_gitconfig;
+
+    my ($raw_gitconfig, $error) = backtick [qw{git config --get-regexp ^branchdates\.}];
+    return $raw_gitconfig;
+}
+}
+
+sub revise_date_format ( $ ) {
+    my (
+        $date_format,
+       ) = @_;
+
+    my $output = get_all_gitconfig;
+
+    my $gitconfig_key = qq{branchdates\\.date-format};
+    if ($output =~ m{^$gitconfig_key\s*([^\n]*)}mi) {
+        $date_format = $1;
+    }
+
+    return $date_format;
+}
+
+sub revise_modes ( $ ) {
+    my (
+        $modes,
+       ) = @_;
+
+    my $output = get_all_gitconfig;
+
+    foreach my $key (qw/color pager sort/) {
+        my $gitconfig_key = qq{branchdates\\.$key};
+        if ($output =~ m{^$gitconfig_key\s*([^\n]*)}mi) {
+            $modes->{$key} = lc $1;
+        }
+    }
+
+    foreach my $boolean_key (qw/pr link/) {
+        my $gitconfig_key = qq{branchdates\\.$boolean_key};
+        if ($output =~ m{^$gitconfig_key\s*([^\n]*)}mi) {
+            my $value = lc $1;
+               $value = 0  if $value eq q{false};
+               $value = 1  if $value eq q{true};
+            $modes->{$boolean_key} = $value;
+        }
+    }
+
+    die qq{$progname: git config branchdates.color must be one of auto, always, never\n}  if defined $modes->{color} and $modes->{color} !~ m{\A(?:auto|always|never)\Z};
+    die qq{$progname: git config branchdates.pager must be one of auto, always, never\n}  if defined $modes->{pager} and $modes->{pager} !~ m{\A(?:auto|always|never)\Z};
+    die qq{$progname: git config branchdates.sort must be one of ascending, descending\n} if defined $modes->{sort}  and $modes->{sort}  !~ m{\A(?:ascending|descending)\Z};
+    die qq{$progname: git config branchdates.pr must be one of true, false, 1, 0\n}       if defined $modes->{pr}    and $modes->{pr}    !~ m{\A(?:1|0)\Z};
+    die qq{$progname: git config branchdates.link must be one of true, false, 1, 0\n}     if defined $modes->{link}  and $modes->{link}  !~ m{\A(?:1|0)\Z};
+
+    return $modes;
+}
+
+sub revise_indicator_key_order ( $$ ) {
+    my (
+        $indicator_key_order,
+        $modes,
+       ) = @_;
+
+    my @new_order = @$indicator_key_order;
+       @new_order = grep { $_ !~ m{^(?:non-)?(?:pr|ci)-} } @new_order unless $modes->{pr};
+
+    return @new_order;
+}
+
+sub revise_indicators ( $$ ) {
+    my (
+        $indicators,
+        $indicator_key_order,
+       ) = @_;
+
+    my $output = get_all_gitconfig;
+    my $esc_code = {
+                    fg           => 38,
+                    bg           => 48,
+                    q{prefix-fg} => 38,
+                    q{suffix-fg} => 38,
+                    bold         => 1,
+                    italic       => 3,
+                    underline    => 4,
+                   };
+
+    foreach my $key (@$indicator_key_order) {
+        my $regexp_key = $key =~ s{non}{no[nt]}r;
+        foreach my $type (qw/
+                             fg
+                             bg
+                             bold
+                             underline
+                             italic
+                             prefix
+                             prefix-fg
+                             suffix
+                             suffix-fg
+                             notty-prefix
+                             notty-suffix
+                            /) {
+            my $gitconfig_key = qq{branchdates\\.indicators\\.${regexp_key}\\.$type};
+            if ($output =~ m{^$gitconfig_key\s*([^\n]*)}mi) {
+                my $value = $1;
+                if (
+                    $value !~ m{\S} or
+                    $value eq 0 or
+                    lc $value eq q{false}
+                   ) {
+                    delete $indicators->{$key}{$type};
+                    next;
+                }
+                $indicators->{$key}{$type} = $value;
+            }
+        }
+    }
+
+    foreach my $key (@$indicator_key_order) {
+
+        foreach my $type (qw/bold underline italic/) {
+            my $value = $indicators->{$key}{$type};
+            next unless $value =~ m{\S};
+            $indicators->{$key}{$type} = qq{\e[$esc_code->{$type};m};
+        }
+
+        foreach my $type (qw/fg bg prefix-fg suffix-fg/) {
+            my $value = $indicators->{$key}{$type};
+            next unless $value =~ m{\S};
+            my $gitconfig_key = qq{branchdates.indicators.$key.$type};
+
+            if ($value =~ m{\A\\e}) {
+                $indicators->{$key}{$type} =~ s{\A\\e}{\e};
+                next;
+            }
+
+            if ($value =~ m{\A#([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})\Z}i) {
+                my @rbg = ( hex $1, hex $2, hex $3 );
+                $indicators->{$key}{$type} = qq{\e[$esc_code->{$type};2;$rbg[0];$rbg[1];$rbg[2]m};
+                next;
+            }
+
+            if (ref $value eq q{ARRAY} and scalar @$value == 3) {
+                $indicators->{$key}{$type} = qq{\e[$esc_code->{$type};2;$value->[0];$value->[1];$value->[2]m};
+                next;
+            }
+
+            if ($value =~ m{^\d+$} and $value >= 30 and $value <= 107) {
+                $indicators->{$key}{$type} = qq{\e[$value;m};
+                next;
+            }
+
+            # else
+            $value =~ m{\A\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)\s*\Z} or die qq{$progname: bad $gitconfig_key value: '$value'};
+            $indicators->{$key}{$type} = qq{\e[$esc_code->{$type};2;$1;$2;$3m};
+        }
+
+    }
+
+    return $indicators;
+}
+
+sub emit_output ( $$$$$ ) {
+    my (
+        $branchtimes,
+        $status,
+        $indicators,
+        $urls,
+        $modes,
+       ) = @_;
+
+    my $color_mode = -t STDOUT;
+       $color_mode = 0 if $modes->{color} eq q{never};
+       $color_mode = 1 if $modes->{color} eq q{always};
+
+    my $pager_mode = -t STDOUT;
+       $pager_mode = 0 if $modes->{pager} eq q{never};
+       $pager_mode = 1 if $modes->{pager} eq q{always};
+
+    my $pager;
+    if ($pager_mode) {
+        my ($pager_command, $error) = backtick[qw/git config core.pager/];
+        unless ($pager_command =~ m{\S}) {
+            $pager_command = q{less};
+        }
+        chomp $pager_command;
+        local $ENV{LESS} = $ENV{LESS} // q{FRX};
+        if ($modes->{pager} eq q{always}) {
+            $ENV{LESS} =~ s{F}{}g;
+            $pager_command .= q{ -+F} if $pager_command =~ m{\Aless}i;
+        }
+        if ($pager_command =~ m{['"\$]}) {
+            open $pager, q{|-}, $pager_command;
+        } else {
+            my @pager_command = split / +/, $pager_command;
+            open $pager, q{|-}, @pager_command;
+        }
+    } else {
+        $pager = \*STDOUT;
+    }
+
+    # tab gets confused by the color escape sequences
+    my $output_separator = $color_mode ? qq{    } : qq{\t};
+
+    my $widest_width = get_widest_width $branchtimes;
+
+    my @branches = sort { $branchtimes->{$a} <=> $branchtimes->{$b} } keys %$branchtimes;
+       @branches = reverse @branches if $modes->{sort} eq q{descending};
+
+    foreach my $branch (@branches) {
+
+        my $time = localtime($branchtimes->{$branch});
+        my $date = $time->strftime($date_format);
+        my $indicator_prefix;
+        my $indicator_suffix;
+        my $major_style;
+        my $link_open;
+        my $link_close;
+
+        if ($color_mode) {
+            foreach my $stat (@indicator_key_order) {
+                foreach my $color (qw/fg bg bold underline italic/) {
+                    next unless $status->{$stat}{$branch};
+                    next unless $indicators->{$stat}{$color} =~ m{\S};
+                    $major_style .= $indicators->{$stat}{$color};
+                }
+            }
+            foreach my $stat (@indicator_key_order) {
+                if (
+                    $status->{$stat}{$branch} and
+                    $indicators->{$stat}{prefix} =~ m{\S}
+                   ) {
+                    $indicator_prefix .= $indicators->{$stat}{'prefix-fg'};
+                    $indicator_prefix .= $indicators->{$stat}{prefix};
+                    $indicator_prefix .= $indicators->{_reset} . $major_style if length $indicators->{$stat}{'prefix-fg'};
+                } else {
+                    $indicator_prefix .= q{ } x length $indicators->{$stat}{prefix};
+                }
+            }
+            if ($modes->{link} and $urls->{$branch} =~ m{\S}) {
+                $link_open = qq{$indicators->{_link}$urls->{$branch}\a};
+                $link_close = qq{$indicators->{_link}\a};
+            }
+        } else {
+            foreach my $stat (@indicator_key_order) {
+                if (
+                    $status->{$stat}{$branch} and
+                    $indicators->{$stat}{'notty-prefix'} =~ m{\S}
+                   ) {
+                    $indicator_prefix .= $indicators->{$stat}{'notty-prefix'};
+                } else {
+                    $indicator_prefix .= q{ } x length $indicators->{$stat}{'notty-prefix'};
+                }
+            }
+        }
+
+        my $pad_len = $widest_width - length $branch;
+        my $right_padding = q{ } x $pad_len;
+        $indicator_prefix .= q{ } if length $indicator_prefix;
+
+        print $pager $major_style . $date . $output_separator . $indicator_prefix . $link_open . $branch . $link_close . $right_padding;
+        print $pager $indicators->{_reset} if $color_mode;
+
+        if ($color_mode) {
+            foreach my $stat (@indicator_key_order) {
+                if (
+                    $status->{$stat}{$branch} and
+                    $indicators->{$stat}{suffix} =~ m{\S}
+                   ) {
+                    $indicator_suffix .= $indicators->{$stat}{'suffix-fg'};
+                    $indicator_suffix .= $indicators->{$stat}{suffix};
+                    $indicator_suffix .= $indicators->{_reset};
+                } else {
+                    $indicator_suffix .= q{ } x length $indicators->{$stat}{suffix};
+                }
+            }
+        } else {
+            foreach my $stat (@indicator_key_order) {
+                if (
+                    $status->{$stat}{$branch} and
+                    $indicators->{$stat}{'notty-suffix'} =~ m{\S}
+                   ) {
+                    $indicator_suffix .= $indicators->{$stat}{'notty-suffix'};
+                } else {
+                    $indicator_suffix .= q{ } x length $indicators->{$stat}{'notty-suffix'};
+                }
+            }
+        }
+        $indicator_suffix = q{ } . $indicator_suffix if length $indicator_suffix;
+
+        print $pager $indicator_suffix;
+        print $pager qq{\n};
+    }
+}
+
+#
+# Emacs
+#
+# Local Variables:
+# coding: utf-8
+# End:
+#
+# LocalWords: branchname refname reflog branchnames FFFFFF
+#
