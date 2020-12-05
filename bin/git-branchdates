@@ -176,6 +176,8 @@ my @indicator_key_order = qw/
                              non-pr-merged
                              pr-closed
                              non-pr-closed
+                             pr-draft
+                             non-pr-draft
                              pr-review-assigned
                              non-pr-review-assigned
                              pr-review-approved
@@ -294,6 +296,8 @@ Configuration
         non-pr-merged
         pr-closed
         non-pr-closed
+        pr-draft
+        non-pr-draft
         pr-review-assigned
         non-pr-review-assigned
         pr-review-approved
@@ -557,7 +561,7 @@ sub get_pr_statuses ( $ ) {
             if ($gh_output =~ m{^url:\s+(\S+)}m) {
                 $urls->{$branch} = $1;
             }
-            foreach my $state (qw/open closed merged/) {
+            foreach my $state (qw/open closed merged draft/) {
                 if ($gh_output =~ m{^state:\s+${state}$}mi) {
                     $saw_gh_success = 1;
                     $status->{"pr-$state"}{$branch} = 1;
@@ -601,6 +605,8 @@ sub get_ci_statuses ( $ ) {
 
     my $isa_tty = -t STDOUT;
     my @branches = keys %{$status->{'pr-open'}};
+    push @branches, keys %{$status->{'pr-draft'}};
+
     my $show_progress;
        $show_progress = 1 if scalar @branches > 5 or $modes->{verbose};
        $show_progress = 0 if !$isa_tty or $modes->{quiet};
