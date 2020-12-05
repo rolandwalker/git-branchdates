@@ -558,11 +558,11 @@ sub get_pr_statuses ( $ ) {
             my ($gh_output, $gh_err) = backtick [qw/gh pr view/, $branch];
             next if $gh_err =~ m{\S};
             $status->{'pr-associated'}{$branch} = 1;
-            if ($gh_output =~ m{^url:\s+(\S+)}m) {
+            if ($gh_output =~ m{^url:[ \t]+(\S+)}m) {
                 $urls->{$branch} = $1;
             }
             foreach my $state (qw/open closed merged draft/) {
-                if ($gh_output =~ m{^state:\s+${state}$}mi) {
+                if ($gh_output =~ m{^state:[ \t]+${state}$}mi) {
                     $saw_gh_success = 1;
                     $status->{"pr-$state"}{$branch} = 1;
                     last;
