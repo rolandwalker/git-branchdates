@@ -1,0 +1,8 @@
+[branchdates "indicators.non-pr-review-assigned"]
+    suffix = ⚪
+[branchdates "indicators.pr-review-approved"]
+    suffix = 👍
+[branchdates "indicators.pr-review-commented"]
+    suffix = 💭
+[branchdates "indicators.pr-review-changes-requested"]
+    suffix = 🛑
