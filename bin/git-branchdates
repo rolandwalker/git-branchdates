@@ -176,6 +176,14 @@ my @indicator_key_order = qw/
                              non-pr-merged
                              pr-closed
                              non-pr-closed
+                             pr-review-assigned
+                             non-pr-review-assigned
+                             pr-review-approved
+                             non-pr-review-approved
+                             pr-review-commented
+                             non-pr-review-commented
+                             pr-review-changes-requested
+                             non-pr-review-changes-requested
                              ci-pending
                              non-ci-pending
                              ci-fail
@@ -286,6 +294,14 @@ Configuration
         non-pr-merged
         pr-closed
         non-pr-closed
+        pr-review-assigned
+        non-pr-review-assigned
+        pr-review-approved
+        non-pr-review-approved
+        pr-review-commented
+        non-pr-review-commented
+        pr-review-changes-requested
+        non-pr-review-changes-requested
         ci-pending
         non-ci-pending
         ci-fail
@@ -546,6 +562,25 @@ sub get_pr_statuses ( $ ) {
                     $saw_gh_success = 1;
                     $status->{"pr-$state"}{$branch} = 1;
                     last;
+                }
+            }
+            unless ($status->{'pr-closed'}{$branch}) {
+                if ($gh_output =~ m{^reviewers:[ \t]+(\S[^\n]*)}m) {
+                    my $reviewers_text = $1;
+                    my @reviewers = split /,/, $reviewers_text;
+                    $status->{'pr-review-assigned'}{$branch} = 1;
+                    foreach my $uc_state (qw/Commented Changes.requested/) {
+                        my $lc_state = lc $uc_state;
+                           $lc_state =~ s{\.}{-}g;
+                        my @has_state = grep { $_ =~ m{\($uc_state\)} } @reviewers;
+                        $status->{"pr-review-$lc_state"}{$branch} = 1 if scalar @has_state;
+                    }
+                    foreach my $uc_state (qw/Approved/) {
+                        my $lc_state = lc $uc_state;
+                           $lc_state =~ s{\.}{-}g;
+                        my @has_state = grep { $_ =~ m{\($uc_state\)} } @reviewers;
+                        $status->{"pr-review-$lc_state"}{$branch} = 1 if scalar @has_state == @reviewers;
+                    }
                 }
             }
         }
