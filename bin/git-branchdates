@@ -715,6 +715,12 @@ sub deduce_inverted_statuses ( $$$ ) {
                ) {
                 next;
             }
+            if ($stat =~ m{^pr-review} and
+                ($status->{'pr-closed'}{$branch} or
+                 $status->{'pr-merged'}{$branch} or
+                 $status->{merged}{$branch})) {
+                next;
+            }
             unless ($status->{$stat}{$branch}) {
                 $status->{$non_stat}{$branch} = 1;
             }
