@@ -3,6 +3,6 @@
 [branchdates "indicators.pr-review-approved"]
     suffix = 👍
 [branchdates "indicators.pr-review-commented"]
-    suffix = 💭
+    suffix = 💬
 [branchdates "indicators.pr-review-changes-requested"]
     suffix = 🛑
