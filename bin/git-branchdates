@@ -205,7 +205,7 @@ my $progname = $0;
    $progname =~ s{\A(.*/)?([^/]+?)(\.plx?)?\Z}{$2};
 
 my $usage = qq{
-$progname [ -pr | -link | -color=<string> | -pager=<string> | -sort=<string> | -help | -version ]
+$progname [ -pr | -link | -json | -color=<string> | -pager=<string> | -sort=<string> | -help | -version ]
 
 List branches by date, where both checkout and commit activity count as
 touching the branch.
@@ -218,6 +218,8 @@ Options
     -link        Use OSC 8 terminal escape codes to hyperlink branch names to
                  corresponding GitHub Pull Request URLs.  Known to be supported
                  on iTerm2.  No effect unless -pr is also set.
+
+    -json        Emit structured JSON instead of a text listing.
 
     -color=<auto|always|never>
 
@@ -370,6 +372,7 @@ Getopt::Long::Configure(qw/auto_version no_auto_abbrev prefix_pattern=--|- long_
 die $usage unless GetOptions(
                              q{pr}      => \$modes->{pr},
                              q{link}    => \$modes->{link},
+                             q{json}    => \$modes->{json},
                              q{color=s} => \$modes->{color},
                              q{pager=s} => \$modes->{pager},
                              q{sort=s}  => \$modes->{sort},
@@ -965,6 +968,20 @@ sub emit_output ( $$$$$ ) {
         $urls,
         $modes,
        ) = @_;
+
+    if ($modes->{json}) {
+        require Data::Dumper;
+        no warnings qw/once/;
+        local $Data::Dumper::Purity = 1;
+        local $Data::Dumper::Terse = 1;
+        local $Data::Dumper::Deepcopy = 1;
+        local $Data::Dumper::Indent = 0;
+        local $Data::Dumper::Pair = q{:};
+        my $json = Data::Dumper::Dumper({branchdates => $branchtimes, status => $status});
+           $json =~ s{'}{"}g;
+        say $json;
+        exit;
+    }
 
     my $color_mode = -t STDOUT;
        $color_mode = 0 if $modes->{color} eq q{never};
